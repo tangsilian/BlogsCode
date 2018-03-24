@@ -1,7 +1,9 @@
-#解析DEX结构的一个项目
+### 解析DEX结构的一个项目
 
 ![DEX文件图](![](http://p19ocs37q.bkt.clouddn.com/15219024261896.jpg)
-在[android源码](https://android.googlesource.com/platform/dalvik/+/android-4.4.2_r2/libdex/DexFile.h)中的/dalvik/libdex/DexFile.h找到关于dexfile的定义
+
+在[android源码](https://android.googlesource.com/platform/dalvik/+/android-4.4.2_r2/libdex/DexFile.h)
+中的/dalvik/libdex/DexFile.h找到关于dexfile的定义
 
 
 
@@ -52,6 +54,7 @@ System.out.println(“Hello, Android!\n”);
 }
 }
 ```
+
 在当前工作路径下 ， 编译方法如下 ：
 
 * 1. 编译成 java class 文件
@@ -317,7 +320,9 @@ virtualmethodsSize   00
 ```
 
 参考：
+
 http://www.wjdiankong.cn/archives/579
+
 https://github.com/guanchao/dexParser
 
 
