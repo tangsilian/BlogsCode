@@ -1,0 +1,10 @@
+mapSZ:0x1a1f8
+base 0xc1e000
+load1 = 0x100c1e054, offset = 0x0
+load2 = 0x100c1e074, offset = 0x10e88
+dynamic = 0x100c1e094, offset = 0x10ea0
+addr:0x10e88
+new section add:20000
+offset:1a1f8
+还可添加 600 个节
+write len 21010
