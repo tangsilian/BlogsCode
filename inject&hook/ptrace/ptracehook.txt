@@ -1,0 +1,152 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <dlfcn.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <utils/Log.h>
+#include <cutils/properties.h>
+#include <cutils/sockets.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <sys/statfs.h>
+#include <sys/inotify.h>
+#include <poll.h>
+
+#include <cutils/log.h>
+
+#include <sys/reg.h>
+#include <sys/uio.h>
+#include <elf.h>
+#include <asm/ptrace.h>
+#include <sys/ptrace.h>
+#include <linux/ptrace.h>
+
+#include <sys/mman.h>
+
+
+int flag = 1;
+int count = 0;
+
+
+int test()
+{
+    printf("Now in %s. Target is running: %d\n", __func__, count);
+    count++;
+    return 0;   
+}
+
+int hookfun()
+{
+    printf("Now in %s. Target is running: %d\n", __func__, count);
+    count++;
+    return 0;   
+}
+
+int bridge_code()
+{
+
+    asm("stp    x6, x7, [sp,#-16]! \n\t"  
+    "stp    x4, x5, [sp,#-16]! \n\t"  
+    "stp    x2, x3, [sp,#-16]! \n\t"  
+    "stp    x0, x1, [sp,#-16]! \n\t"  
+    "ldr    x6, loc_tar \n\t"
+    "mov    x7, x30 \n\t"
+    "stp    x6, x7, [sp,#-16]! \n\t"  
+    "blr    x6 \n\t"
+    "ldp    x6, x7, [sp],#16 \n\t"
+    "mov    x30,x7 \n\t"
+    "ldp    x0, x1, [sp],#16 \n\t"  
+    "ldp    x2, x3, [sp],#16 \n\t"  
+    "ldp    x4, x5, [sp],#16 \n\t"  
+    "ldp    x6, x7, [sp],#16 \n\t"  
+    "mov    x0, x0 \n\t"            //exec code
+    "mov    x0, x0 \n\t"            //b back
+    "loc_tar: \t\n"
+    ".word 0x0 \t\n"            //hook_func addr
+    ".word 0x0 \t\n"
+    );  
+    return 0;
+}
+
+unsigned int build_jmp_code(long jump_from, long jump_to)
+{
+    ////0 0 0 1 0 1 imm26
+    unsigned int b_inst_1 = 0x14000000;
+    unsigned int b_inst_2 = 0x17000000;
+
+    unsigned int ret;
+    int jump_dis;
+
+//  printf("jump_from   = %lx\n", jump_from);
+//  printf("jump_to   = %lx\n", jump_to);
+
+    jump_dis = jump_to - jump_from;
+
+    printf("jump_dis = %d\n", jump_dis);
+
+    jump_dis /= 4;
+
+//  printf("jump_dis = %d\n", jump_dis);
+
+    if (jump_dis > 0 ) {
+        ret = b_inst_1 | jump_dis;
+    } else {
+        ret = b_inst_2 | (jump_dis & 0xffffff);
+    }
+
+    return ret;
+}
+
+int print_gdb_change_info(long src_addr, long hookfun_addr, long bridge_addr)
+{
+
+    unsigned int src_code;
+    unsigned int src_fill;
+    unsigned int back_fill;
+
+    int fill_opcount  = 14;
+    int jback_opcount = 15;
+    int  hook_opcount = 16;
+
+    src_fill  = build_jmp_code(src_addr, bridge_addr);
+    back_fill = build_jmp_code(bridge_addr + jback_opcount * 4 , src_addr + 4);
+
+    src_code = *(unsigned int *)src_addr;
+
+
+    printf("/************************************/\n");
+    printf("gdb change code as following:\n");
+
+    printf("set *(int *)0x%lx = 0x%x\n", src_addr, src_fill);   
+    printf("set *(int *)0x%lx = 0x%x\n", bridge_addr + fill_opcount * 4, src_code);
+    printf("set *(int *)0x%lx = 0x%x\n", bridge_addr + jback_opcount * 4, back_fill);
+    printf("set *(long *)0x%lx = 0x%lx\n", bridge_addr + hook_opcount * 4, hookfun_addr);
+    printf("/************************************/\n\n");   
+    return 0;
+
+}
+
+int main()
+{
+    pid_t pid;
+    pid = getpid();
+
+    long ret;
+
+    printf("Target pid = %d\n", pid);
+
+    printf("test = %p\n", &test);
+    printf("hookfun = %p\n", &hookfun);
+    printf("bridge_code = %p\n", &bridge_code);
+
+    print_gdb_change_info((long)&test, (long)&hookfun, (long)&bridge_code);
+
+    while(flag) {
+        test();
+        sleep(10);
+    }
+    return 0;
+}

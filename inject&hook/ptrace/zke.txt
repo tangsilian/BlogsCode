@@ -1,0 +1,562 @@
+//背景http://zke1ev3n.me/2015/12/02/Android-so%E6%B3%A8%E5%85%A5/
+
+//如果目标进程是zygote
+static int zygote_special_process(pid_t target_pid){
+	LOGI("[+] zygote process should special take care. \n");
+
+	struct pt_regs regs;
+
+	if (ptrace_getregs(target_pid, &regs) == -1)
+		return -1;
+
+	void* remote_getpid_addr = (void *)get_remote_address(target_pid, getpid);//getpid函数
+	LOGI("[+] Remote getpid addr %p.\n", remote_getpid_addr);
+
+	if(remote_getpid_addr == NULL){
+		return -1;
+	}
+
+	pthread_t tid = 0;
+	pthread_create(&tid, NULL, connect_to_zygote, NULL);
+	pthread_detach(tid);
+
+	if (ptrace_call(target_pid, (uint32_t)remote_getpid_addr, NULL, 0, &regs) == -1) {
+		LOGE("[-] Call remote getpid fails");
+		return -1;
+	}
+
+	if (ptrace_getregs(target_pid, &regs) == -1)
+		return -1;
+
+	LOGI("[+] Call remote getpid result r0=%x, r7=%x, pc=%x, \n", (uint32_t)regs.ARM_r0, (uint32_t)regs.ARM_r7, (uint32_t)regs.ARM_pc);
+	return 0;
+}
+//
+void* find_space_by_mmap(int target_pid, int size) {
+	struct pt_regs regs;
+	if (ptrace_getregs(target_pid, &regs) == -1)
+		return 0;
+
+	long parameters[10];
+
+	/* call mmap */
+	parameters[0] = 0;  // addr
+	parameters[1] = size; // size
+	parameters[2] = PROT_READ | PROT_WRITE | PROT_EXEC;  // prot
+	parameters[3] = MAP_ANONYMOUS | MAP_PRIVATE; // flags
+	parameters[4] = 0; //fd
+	parameters[5] = 0; //offset
+
+	void *remote_mmap_addr = get_remote_address(target_pid, get_method_address("/system/lib/libc.so", "mmap"));
+	LOGI("[+] Calling mmap in target process. mmap addr %p.\n", remote_mmap_addr);
+
+	if (remote_mmap_addr == NULL) {
+		LOGE("[-] Get Remote mmap address fails.\n");
+		return 0;
+	}
+
+	if (ptrace_call(target_pid, (uint32_t) remote_mmap_addr, parameters, 6, &regs) == -1)
+		return 0;
+
+	if (ptrace_getregs(target_pid, &regs) == -1)
+		return 0;
+
+	LOGI("[+] Target process returned from mmap, return r0=%x, r7=%x, pc=%x, \n", regs.ARM_r0, regs.ARM_r7, regs.ARM_pc);
+
+	return regs.ARM_pc == 0 ? (void *) regs.ARM_r0 : 0;
+}
+
+/**
+ * write data to dest
+ */
+int ptrace_write(pid_t pid, uint8_t *dest, uint8_t *data, size_t size) {
+	uint32_t i, j, remain;
+	uint8_t *laddr;
+
+	union u {
+		long val;
+		char chars[sizeof(long)];
+	} d;
+
+	j = size / 4;
+    //求余
+	remain = size % 4;
+
+	laddr = data;
+
+	for (i = 0; i < j; i++) {
+		memcpy(d.chars, laddr, 4);
+		ptrace(PTRACE_POKETEXT, pid, (void *)dest, (void *)d.val);
+
+		dest += 4;
+		laddr += 4;
+	}
+    //写入剩下的字节
+	if (remain > 0) {
+		d.val = ptrace(PTRACE_PEEKTEXT, pid, (void *)dest, NULL);
+		for (i = 0; i < remain; i++) {
+			d.chars[i] = *laddr++;
+		}
+
+		ptrace(PTRACE_POKETEXT, pid, (void *)dest, (void *)d.val);
+
+	}
+
+	return 0;
+}
+//ptrace_call开始加载so的过程
+int ptrace_call(pid_t pid, uint32_t addr, long *params, int num_params, struct pt_regs* regs) {
+	uint32_t i;
+
+	for (i = 0; i < num_params && i < 4; i++) {
+		regs->uregs[i] = params[i];
+	}
+
+	if (i < num_params) {
+		regs->ARM_sp-= (num_params - i) * sizeof(long);
+		ptrace_write(pid, (uint8_t *) regs->ARM_sp, (uint8_t *) &params[i], (num_params - i) * sizeof(long));
+	}
+
+	regs->ARM_pc= addr;
+	if (regs->ARM_pc& 1) {
+		/* thumb */
+		regs->ARM_pc &= (~1u);
+		regs->ARM_cpsr |= CPSR_T_MASK;
+	} else {
+		/* arm */
+		regs->ARM_cpsr &= ~CPSR_T_MASK;
+	}
+
+	regs->ARM_lr= 0;	//置子程序的返回地址为空，以便函数执行完后，返回到null地址，产生SIGSEGV错误
+
+	if (ptrace_setregs(pid, regs) == -1 || ptrace_continue(pid) == -1) {
+		return -1;
+	}
+
+//	waitpid(pid, NULL, WUNTRACED);	
+	
+	int status = 0;
+//	waitpid(pid,&stat,WUNTRACED);
+  	pid_t res;
+   	waitpid(pid, NULL, WUNTRACED);  
+	/*
+	 * Restarts  the stopped child as for PTRACE_CONT, but arranges for
+	 * the child to be stopped at the next entry to or exit from a sys‐
+	 * tem  call,  or  after execution of a single instruction, respec‐
+	 * tively.
+	 */
+	if (ptrace(PTRACE_SYSCALL, pid, NULL, 0) < 0) {
+		LOGE("ptrace_syscall");
+		return -1;
+	}
+
+	waitpid(pid, NULL, WUNTRACED);
+
+	if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL ) < 0) {
+		LOGE("ptrace_syscall");
+		return -1;
+	}
+
+	res = waitpid(pid, NULL, WUNTRACED);
+
+	LOGI("[+] status is %x",status);
+    	if (res != pid || !WIFSTOPPED (status))//WIFSTOPPED(status) 若为当前暂停子进程返回的状态，则为真
+        	return 0;
+	LOGI("[+]done %d\n",(WSTOPSIG (status) == SIGSEGV)?1:0);
+	//设置siginal 11信号处理函数
+/*	if(signal(SIGSEGV,handler) == SIG_ERR){
+		LOGE("[-]can not set handler for SIGSEGV");
+	}*/
+
+	return 0;
+}
+
+/**
+ * attach to target process
+ */
+int ptrace_attach(pid_t pid, int zygote) {
+
+	if (ptrace(PTRACE_ATTACH, pid, NULL, 0) < 0) {
+		LOGE("ptrace_attach");
+		return -1;
+	}
+
+	waitpid(pid, NULL, WUNTRACED);
+
+	/*
+	 * Restarts  the stopped child as for PTRACE_CONT, but arranges for
+	 * the child to be stopped at the next entry to or exit from a sys‐
+	 * tem  call,  or  after execution of a single instruction, respec‐
+	 * tively.
+	 */
+	if (ptrace(PTRACE_SYSCALL, pid, NULL, 0) < 0) {
+		LOGE("ptrace_syscall");
+		return -1;
+	}
+
+	waitpid(pid, NULL, WUNTRACED);
+
+    //如果是zygote进程，则需要使用connect_to_zygote函数
+	if (zygote) {
+		connect_to_zygote(NULL);
+	}
+
+	if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL ) < 0) {
+		LOGE("ptrace_syscall");
+		return -1;
+	}
+
+	waitpid(pid, NULL, WUNTRACED);
+
+	return 0;
+}
+
+static void* connect_to_zygote(void* arg){
+	int s, len;
+	struct sockaddr_un remote;
+//zygote进程接收socket连接的时间间隔是500ms，2s足以保证此socket连接能连接到zygote socket
+	LOGI("[+] wait 2s...");
+	sleep(2);
+	//sleep(0.5);
+	if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) != -1) {
+		remote.sun_family = AF_UNIX;
+		strcpy(remote.sun_path, "/dev/socket/zygote");
+		len = strlen(remote.sun_path) + sizeof(remote.sun_family);
+		LOGI("[+] start to connect zygote socket");
+		connect(s, (struct sockaddr *) &remote, len);
+		LOGI("[+] close socket");
+		close(s);
+	}
+
+	return NULL ;
+}
+
+const char* get_process_name(pid_t pid) {
+	static char buffer[255];
+	FILE* f;
+	char path[255];
+
+	snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+	if ((f = fopen(path, "r")) == NULL) {
+		return NULL;
+	}
+
+	if (fgets(buffer, sizeof(buffer), f) == NULL) {
+		return NULL;
+	}
+
+	fclose(f);
+	return buffer;
+}
+
+/**
+ * read registers' status
+ */
+int ptrace_getregs(pid_t pid, struct pt_regs* regs) {
+	if (ptrace(PTRACE_GETREGS, pid, NULL, regs) < 0) {
+		perror("ptrace_getregs: Can not get register values");
+		return -1;
+	}
+
+	return 0;
+}
+
+/**
+ * set registers' status
+ */
+int ptrace_setregs(pid_t pid, struct pt_regs* regs) {
+	if (ptrace(PTRACE_SETREGS, pid, NULL, regs) < 0) {
+		perror("ptrace_setregs: Can not set register values");
+		return -1;
+	}
+
+	return 0;
+}
+/**
+ * detach from target process
+ */
+int ptrace_detach( pid_t pid )
+{
+    if ( ptrace( PTRACE_DETACH, pid, NULL, 0 ) < 0 )
+    {
+    	LOGE( "ptrace_detach" );
+        return -1;
+    }
+
+    return 0;
+}
+int ptrace_continue(pid_t pid) {
+	if (ptrace(PTRACE_CONT, pid, NULL, 0) < 0) {
+		LOGE("ptrace_cont");
+		return -1;
+	}
+
+	return 0;
+}
+
+int ptrace_syscall(pid_t pid) {
+	return ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+}
+//拿到特定进程里 某些函数函数的地址
+void* get_remote_address(pid_t pid, void *local_addr) {
+	char buf[256];
+	void* local_start = 0;
+	void* local_end = 0;
+	void* remote_start = 0;
+	void* remote_end = 0;
+
+	if(find_module_info_by_address(-1, local_addr, buf, &local_start, &local_end) < 0) {
+		LOGI("[-] find_module_info_by_address FAIL");
+		return NULL;
+	}
+
+	LOGI("[+] the local module is %s", buf);
+
+	if(find_module_info_by_name(pid, buf, &remote_start, &remote_end) < 0) {
+		LOGI("[-] find_module_info_by_name FAIL");
+		return NULL;
+	}
+
+	return (void *)( (uint32_t)local_addr + (uint32_t)remote_start - (uint32_t)local_start );
+}
+
+int find_module_info_by_address(pid_t pid, void* addr, char *module, void** start, void** end) {
+	char statline[1024];
+	FILE *fp;
+	char *address, *proms, *ptr, *p;
+
+	if ( pid < 0 ) {
+		/* self process */
+		snprintf( statline, sizeof(statline), "/proc/self/maps");
+	} else {
+		snprintf( statline, sizeof(statline), "/proc/%d/maps", pid );
+	}
+
+	fp = fopen( statline, "r" );
+
+	if ( fp != NULL ) {
+		while ( fgets( statline, sizeof(statline), fp ) ) {
+			ptr = statline;
+			address = nexttok(&ptr); // skip address
+			proms = nexttok(&ptr); // skip proms
+			nexttok(&ptr); // skip offset
+			nexttok(&ptr); // skip dev
+			nexttok(&ptr); // skip inode
+
+			while(*ptr != '\0') {
+				if(*ptr == ' ')
+					ptr++;
+				else
+					break;
+			}
+
+			p = ptr;
+			while(*p != '\0') {
+				if(*p == '\n')
+					*p = '\0';
+				p++;
+			}
+
+			// 4016a000-4016b000
+			if(strlen(address) == 17) {
+				address[8] = '\0';
+
+				*start = (void*)strtoul(address, NULL, 16);
+				*end   = (void*)strtoul(address+9, NULL, 16);
+
+				// printf("[%p-%p] %s | %p\n", *start, *end, ptr, addr);
+
+				if(addr > *start && addr < *end) {
+					strcpy(module, ptr);
+
+					fclose( fp ) ;
+					return 0;
+				}
+			}
+		}
+
+		fclose( fp ) ;
+	}
+
+	return -1;
+}
+
+int find_module_info_by_name(pid_t pid, const char *module, void** start, void** end) {
+	char statline[1024];
+	FILE *fp;
+	char *address, *proms, *ptr, *p;
+
+	if ( pid < 0 ) {
+		/* self process */
+		snprintf( statline, sizeof(statline), "/proc/self/maps");
+	} else {
+		snprintf( statline, sizeof(statline), "/proc/%d/maps", pid );
+	}
+
+	fp = fopen( statline, "r" );
+
+	if ( fp != NULL ) {
+		while ( fgets( statline, sizeof(statline), fp ) ) {
+			ptr = statline;
+			address = nexttok(&ptr); // skip address
+			proms = nexttok(&ptr); // skip proms
+			nexttok(&ptr); // skip offset
+			nexttok(&ptr); // skip dev
+			nexttok(&ptr); // skip inode
+
+			while(*ptr != '\0') {
+				if(*ptr == ' ')
+					ptr++;
+				else
+					break;
+			}
+
+			p = ptr;
+			while(*p != '\0') {
+				if(*p == '\n')
+					*p = '\0';
+				p++;
+			}
+
+			// 4016a000-4016b000
+			if(strlen(address) == 17) {
+				address[8] = '\0';
+
+				*start = (void*)strtoul(address, NULL, 16);
+				*end   = (void*)strtoul(address+9, NULL, 16);
+
+				// printf("[%p-%p] %s | %p\n", *start, *end, ptr, addr);
+
+				if(strncmp(module, ptr, strlen(module)) == 0) {
+					fclose( fp ) ;
+					return 0;
+				}
+			}
+		}
+
+		fclose( fp ) ;
+	}
+
+	return -1;
+}
+
+void* ptrace_dlopen(pid_t target_pid, void* remote_dlopen_addr, const char*  filename){
+	struct pt_regs regs;
+	if (ptrace_getregs(target_pid, &regs) == -1)
+		return NULL ;
+
+	if (strcmp("zygote", (void *)get_process_name(target_pid)) == 0 && zygote_special_process(target_pid) != 0) {
+		return NULL ;
+	}
+
+	long mmap_params[2];
+	size_t filename_len = strlen(filename) + 1;
+	void* filename_addr = (void *)find_space_by_mmap(target_pid, filename_len);		//调用mmap函数，分配内存（用于存文件名）
+	map_base = filename_addr;
+	LOGI("[+] map_base is %d",(uint32_t)map_base);
+	if (filename_addr == NULL ) {
+		LOGE("[-] Call Remote mmap fails.\n");
+		return NULL ;
+	}
+
+	ptrace_write(target_pid, (uint8_t *)filename_addr, (uint8_t *)filename, filename_len);		//将filename写到filename_addr
+	//初始化参数列表，为后面的ptrace_call的调用
+	mmap_params[0] = (long)filename_addr;  //filename pointer
+	mmap_params[1] = RTLD_NOW | RTLD_GLOBAL; // flag
+    //获取系统调用dlopen的函数地址
+	remote_dlopen_addr = (remote_dlopen_addr == NULL) ? (void *)get_remote_address(target_pid, (void *)dlopen) : remote_dlopen_addr;
+
+	if (remote_dlopen_addr == NULL) {
+		LOGE("[-] Get Remote dlopen address fails.\n");
+		return NULL;
+	}
+    //调用dlopen函数
+	if (ptrace_call(target_pid, (uint32_t) remote_dlopen_addr, mmap_params, 2, &regs) == -1)
+		return NULL;
+
+	if (ptrace_getregs(target_pid, &regs) == -1)
+		return NULL;
+
+	LOGI("[+] Target process returned from dlopen, return r0=%x, r7=%x, pc=%x, \n", (uint32_t)regs.ARM_r0, (uint32_t)regs.ARM_r7, (uint32_t)regs.ARM_pc);
+
+	return regs.ARM_pc == 0 ? (void *) regs.ARM_r0 : NULL;
+}
+
+int main(int argc, char* argv[]) {
+
+	struct pt_regs regs;
+	//process_hook.dso = strdup(argv[1]);	//将参数1的字符串拷贝给process_hook.dso
+	//process_hook.pid = atoi(argv[1]);	//把参数2（字符串）转换为长整型
+	process_hook.dso = "/system/lib/libhookhelper.so";//在注入zygote时，必须把so放在system目录(也可以先关闭SEAndroid)
+	process_hook.pid = find_pid_of("zygote");
+
+//	if (access(process_hook.dso, R_OK|X_OK) < 0) {		//判断so文件是否可读，可写
+	if (access(process_hook.dso, R_OK) < 0) {
+		LOGE("[-] so file must chmod rx\n");
+		return 1;
+	}
+	const char* process_name = get_process_name(process_hook.pid);		//通过pid获取进程名字
+	ptrace_attach(process_hook.pid, (int)strstr(process_name,"zygote"));		//衔接到zygote进程
+	LOGI("[+] ptrace attach to [%d] %s\n", process_hook.pid, get_process_name(process_hook.pid));
+
+	if (ptrace_getregs(process_hook.pid, &regs) < 0) {		//读取当前寄存器的内容，并保存到regs中
+		LOGE("[-] Can't get regs %d\n", errno);
+		goto DETACH;
+	}
+
+	LOGI("[+] pc: %x, r7: %x", (uint32_t)regs.ARM_pc, (uint32_t)regs.ARM_r7);
+
+	void* remote_dlsym_addr = get_remote_address(process_hook.pid, (void *)dlsym);		//获取dlsym,dlopen的地址
+	void* remote_dlopen_addr =  get_remote_address(process_hook.pid, (void *)dlopen);
+
+	LOGI("[+] remote_dlopen address %p\n", remote_dlopen_addr);
+	LOGI("[+] remote_dlsym  address %p\n", remote_dlsym_addr);
+
+	void *handler = NULL; 
+	handler = ptrace_dlopen(process_hook.pid, remote_dlopen_addr, process_hook.dso);		//调用dlopen函数，打开共享库，返回共享库地址	
+
+	LOGI("[+] ptrace_dlopen handle: %p\n", handler);
+	if(handler == NULL){
+		LOGE("[-] Ptrace dlopen fail. %s\n", dlerror());
+		goto DETACH;
+	}
+
+	//调用ptrace_dlsym函数，获取so_entry函数的地址
+	uint32_t proc = 0;
+	proc = (uint32_t)ptrace_dlsym(process_hook.pid,remote_dlsym_addr,handler,"hook_entry");
+	if(proc == 0){
+		LOGE("[-] Ptrace dlsym fail.\n");	
+		goto DETACH;
+	}
+	LOGI("[+] so_entry = %x\n",proc);
+
+	int base = call_so_entry(process_hook.pid, proc);
+	LOGI("[+] base is %d\n",base);
+	if (base == -1){
+		LOGE("[-] Call so_entry function fail.\n");
+		goto DETACH;
+	}
+	
+//regs.ARM_cpsr代表的是程序状态寄存器，出现在ptrace_call函数中
+	if (regs.ARM_pc & 1 ) {
+		// thumb
+		regs.ARM_pc &= (~1u);
+		regs.ARM_cpsr |= CPSR_T_MASK;
+	} else {
+		// arm
+		regs.ARM_cpsr &= ~CPSR_T_MASK;
+	}
+
+//还原寄存器的内容
+	if (ptrace_setregs(process_hook.pid, &regs) == -1) {
+		LOGE("[-] Set regs fail. %s\n", strerror(errno));
+		goto DETACH;
+	}
+
+	LOGI("[+] Inject success!\n");
+
+DETACH:
+	ptrace_detach(process_hook.pid);
+	LOGI("[+] Inject done!\n");
+	return 0;
+}

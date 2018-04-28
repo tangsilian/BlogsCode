@@ -1,0 +1,41 @@
+当前目录包含2个工程项目：IBored、InlineHook。用来配合讲解Android平台下Inline Hook实现。
+
+IBored：
+	游戏IBored工程，Android工程，可用Android Studio直接打开。
+	该应用为一个DEMO游戏，等待30S即会得到成功提示。
+	功能逻辑在Native层实现，Java层只负责更新提示语。
+
+InlineHook:
+	InlineHoo功能模块+一个针对IBored的测试函数，NDK工程，直接ndk-build可生成一个so文件。
+	注入IBored游戏后会自动hook游戏IBored的Update函数，将uiTimeCount强制锁定为0x333。
+	导致不需要30S即可得到成功提示。
+
+目录树结构：
+.
+├── IBored
+│   ├── IBored.iml
+│   ├── app
+│   │   ├── app.iml
+│   │   ├── build
+│   │   ├── build.gradle
+│   │   ├── libs
+│   │   ├── proguard-rules.pro
+│   │   └── src
+│   ├── build.gradle
+│   ├── gradle
+│   │   └── wrapper
+│   ├── gradle.properties
+│   ├── gradlew
+│   ├── gradlew.bat
+│   ├── local.properties
+│   └── settings.gradle
+└── ihook
+    ├── jni
+    │   ├── Android.mk
+    │   ├── Application.mk
+    │   ├── InlineHook
+    │   └── Interface
+    ├── libs
+    │   └── armeabi-v7a
+    └── obj
+        └── local
