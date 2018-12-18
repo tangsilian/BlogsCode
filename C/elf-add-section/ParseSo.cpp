@@ -43,6 +43,7 @@ int addSectionFun(char *lpPath, char *szSecname, unsigned int nNewSecSize)
 	}
 	fdr = fopen(lpPath, "rb");
 	strcpy(name, lpPath);
+	//可以判断字符串里是否存在某个字符
 	if(strchr(name, '.'))
 	{
 		strcpy(strchr(name, '.'), "_new.so");
@@ -80,7 +81,6 @@ int addSectionFun(char *lpPath, char *szSecname, unsigned int nNewSecSize)
 	{
 		if(t_phdr->p_type == PT_LOAD)//修改Program Header中的第一个type=LOAD段（可加载段）的文件大小和内存大小为修改之后整个文件的长度(这个后面会详细说明)
 		{
-			//
 			if(flag == 0)
 			{
 				load1 = t_phdr;
